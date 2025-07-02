@@ -1,0 +1,386 @@
+de<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>PeakFinder Overlay – Automatisches „Rückholen“ nach Fixierung lösen</title>
+  <style>
+    body { margin:0; background:#222; }
+    #basis-img { position:fixed; left:0; top:0; width:100vw; height:100vh; object-fit:contain; z-index:0; }
+    #overlay-img {
+      position:absolute; 
+      max-width:none; max-height:none;
+      z-index:10; opacity:0.5; pointer-events:auto; cursor:move;
+      will-change:transform,left,top;
+    }
+    #overlay-canvas { position:fixed; left:0; top:0; z-index:10; pointer-events:none; }
+    #target-crosshair {
+      position:fixed; left:60vw; top:55vh; width:44px; height:44px;
+      z-index:100; touch-action:none; cursor:pointer; user-select:none;
+      display:block; opacity:0.95; pointer-events:auto;
+    }
+    #controls {
+      position:fixed; top:12px; right:12px; color:#fff; background:#222c; padding:10px; border-radius:7px; z-index:99;
+    }
+    #controls label { margin-left:7px; }
+    #fix-btn, #unfix-btn, #repaint-btn, #reset-btn, #eck-debug-btn { margin-top: 8px; width: 190px; font-size: 15px; border-radius: 6px; padding: 2px 7px; background: #f90b; color: #222; border: 1.5px solid #fa0; font-weight: bold; cursor: pointer; }
+    #fix-btn[disabled], #unfix-btn[disabled], #repaint-btn[disabled], #reset-btn[disabled], #eck-debug-btn[disabled] { background: #5556; color: #aaa; border: 1.5px solid #666; cursor: default; }
+    #eckpunkte-img, #eckpunkte-canvas, #eckpunkte-soll { font-size:12px; margin-top:6px; }
+    #eckpunkte-img { color: #fc4; }
+    #eckpunkte-canvas { color: #3cf; }
+    #eckpunkte-soll { color: #6f6; }
+  </style>
+</head>
+<body>
+  <img id="basis-img" style="display:none">
+  <img id="overlay-img" style="display:none">
+  <canvas id="overlay-canvas" style="display:none"></canvas>
+  <svg id="target-crosshair" width="44" height="44">
+    <circle cx="22" cy="22" r="20" stroke="#ff9900" stroke-width="2.5" fill="none" />
+    <line x1="22" y1="4" x2="22" y2="40" stroke="#ff9900" stroke-width="2" />
+    <line x1="4" y1="22" x2="40" y2="22" stroke="#ff9900" stroke-width="2" />
+    <circle cx="22" cy="22" r="2.8" stroke="#ff9900" stroke-width="1.2" fill="#ff9900"/>
+  </svg>
+  <div id="controls">
+    <input type="file" id="basis-upload" accept="image/*"><br>
+    <input type="file" id="overlay-upload" accept="image/*"><br>
+    <label>Transparenz: <input id="opacity" type="range" min="0" max="100" value="50"> <span id="opacity-value">50%</span></label><br>
+    <label>Zoom X: <input id="zoomx" type="range" min="50" max="200" value="100"> <span id="zoomx-value">100%</span></label><br>
+    <button id="fix-btn">Fixieren</button>
+    <button id="unfix-btn" disabled>Fixierung lösen</button><br>
+    <button id="repaint-btn" disabled>IMG-Overlay auf Canvas-Position</button>
+    <button id="reset-btn" disabled>IMG-Overlay auf Fixpunkt-Lage</button>
+    <button id="eck-debug-btn">Eckpunkte anzeigen</button>
+    <div id="eckpunkte-img"></div>
+    <div id="eckpunkte-canvas"></div>
+    <div id="eckpunkte-soll"></div>
+  </div>
+  <script>
+    let basisImg = document.getElementById('basis-img');
+    let overlayImg = document.getElementById('overlay-img');
+    let overlayLoaded = false;
+    let canvas = document.getElementById('overlay-canvas');
+    let ctx = canvas.getContext('2d');
+    let zoomX = 1.0;
+    let opacity = 0.5;
+    let cross = document.getElementById('target-crosshair');
+    let crossX = window.innerWidth * 0.6, crossY = window.innerHeight * 0.55;
+    let draggingOverlay = false, offsetOverlayX=0, offsetOverlayY=0;
+    let draggingCross = false, crossOffsetX=0, crossOffsetY=0;
+    let fixActive = false, fixData=null;
+    let repaintBtn = document.getElementById('repaint-btn');
+    let resetBtn = document.getElementById('reset-btn');
+
+	function formatEckpunkte(P1, P2, P3, P4, prefix) {
+      // Helper function to format a point, checking if values are numbers
+	  // zum  verhindern, dass verwendet wird: [["-","-"],["-","-"],["-","-"],["-","-"]]
+	  // aus den function berechneEckpunkteCanvas und function berechneEckpunkteSoll
+      const formatPoint = (point) => point.map(x => typeof x === 'number' ? x.toFixed(1) : x).join(", ");
+
+      return `<b>${prefix}:</b><br>`
+        + "P1 " + formatPoint(P1) + " | "
+        + "P2 " + formatPoint(P2) + "<br>"
+        + "P3 " + formatPoint(P3) + " | "
+        + "P4 " + formatPoint(P4) + "<br>";
+    }
+
+    function berechneEckpunkteImg() {
+      let left = parseFloat(overlayImg.style.left) || 0;
+      let top = parseFloat(overlayImg.style.top) || 0;
+      let ow = overlayImg.width * zoomX;
+      let oh = overlayImg.height;
+      let P1 = [left, top];
+      let P2 = [left + ow, top];
+      let P3 = [left, top + oh];
+      let P4 = [left + ow, top + oh];
+      return [P1, P2, P3, P4];
+    }
+
+    function berechneEckpunkteCanvas() {
+      if (!fixActive || !fixData || !overlayLoaded) return [["-","-"],["-","-"],["-","-"],["-","-"]];
+      let ow = overlayImg.width, oh = overlayImg.height;
+      let fixScreenX = fixData.crossX;
+      let xf = fixData.relX * ow;
+      let overlayTop = fixData.overlayTop;
+      let leftX = fixScreenX - xf * zoomX;
+      let topY = overlayTop;
+      let P1 = [leftX, topY];
+      let P2 = [leftX + ow * zoomX, topY];
+      let P3 = [leftX, topY + oh];
+      let P4 = [leftX + ow * zoomX, topY + oh];
+      return [P1, P2, P3, P4];
+    }
+
+    // Mathematische "Soll"-Position nach fixData/relX/crossX (wie früher)
+    function berechneEckpunkteSoll() {
+      if (!fixData || !overlayLoaded) return [["-","-"],["-","-"],["-","-"],["-","-"]];
+      let ow = overlayImg.width, oh = overlayImg.height;
+      let xf = fixData.relX * ow;
+      let leftSoll = (fixData.crossX - xf * zoomX);
+      let topSoll = fixData.overlayTop;
+      let P1 = [leftSoll, topSoll];
+      let P2 = [leftSoll + ow * zoomX, topSoll];
+      let P3 = [leftSoll, topSoll + oh];
+      let P4 = [leftSoll + ow * zoomX, topSoll + oh];
+      return [P1, P2, P3, P4];
+    }
+
+    function updateEckpunkteAnzeigen() {
+      let eckImg = berechneEckpunkteImg();
+      document.getElementById('eckpunkte-img').innerHTML = formatEckpunkte(eckImg[0], eckImg[1], eckImg[2], eckImg[3], "IMG Overlay");
+      let eckCanvas = berechneEckpunkteCanvas();
+      document.getElementById('eckpunkte-canvas').innerHTML = formatEckpunkte(eckCanvas[0], eckCanvas[1], eckCanvas[2], eckCanvas[3], "Canvas Overlay");
+      let eckSoll = berechneEckpunkteSoll();
+      document.getElementById('eckpunkte-soll').innerHTML = formatEckpunkte(eckSoll[0], eckSoll[1], eckSoll[2], eckSoll[3], "Fixpunkt-Lage (Mathematisch)");
+    }
+
+    document.getElementById('eck-debug-btn').onclick = updateEckpunkteAnzeigen;
+
+    // BASIS BILD LADEN
+    document.getElementById('basis-upload').addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (file) {
+        basisImg.src = URL.createObjectURL(file);
+        basisImg.style.display = '';
+        updateEckpunkteAnzeigen();
+      }
+    });
+
+    // OVERLAY BILD LADEN
+    document.getElementById('overlay-upload').addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (file) {
+        overlayImg.src = URL.createObjectURL(file);
+        overlayImg.style.display = '';
+        overlayLoaded = true;
+        overlayImg.onload = () => { overlayImg.style.display = ''; updateEckpunkteAnzeigen(); };
+      }
+    });
+
+    // OVERLAY DRAG (solange nicht fixiert)
+    overlayImg.addEventListener('mousedown', e => {
+      if (fixActive) return;
+      draggingOverlay = true;
+      offsetOverlayX = e.clientX - overlayImg.offsetLeft;
+      offsetOverlayY = e.clientY - overlayImg.offsetTop;
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', e => {
+      if (!draggingOverlay || fixActive) return;
+      overlayImg.style.left = (e.clientX - offsetOverlayX) + 'px';
+      overlayImg.style.top = (e.clientY - offsetOverlayY) + 'px';
+      overlayImg.style.transformOrigin = "0px 0px";
+      overlayImg.style.transform = `scale(${zoomX},1)`;
+      updateEckpunkteAnzeigen();
+      e.preventDefault();
+    });
+    document.addEventListener('mouseup', ()=>{ draggingOverlay=false; });
+
+    // ZOOM (IMMER, AUCH NICHT FIXIERT)
+    document.getElementById('zoomx').addEventListener('input', e => {
+      zoomX = e.target.value / 100;
+      document.getElementById('zoomx-value').textContent = Math.round(zoomX*100) + "%";
+      if (fixActive) {
+        drawCanvasOverlay();
+      } else {
+        overlayImg.style.transformOrigin = "0px 0px";
+        overlayImg.style.transform = `scale(${zoomX},1)`;
+        updateEckpunkteAnzeigen();
+      }
+    });
+
+    // ZIELKREIS DRAG
+    cross.addEventListener('mousedown', e => {
+      draggingCross = true;
+      crossOffsetX = e.clientX - cross.getBoundingClientRect().left;
+      crossOffsetY = e.clientY - cross.getBoundingClientRect().top;
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', e => {
+      if (!draggingCross) return;
+      crossX = e.clientX - crossOffsetX + 22;
+      crossY = e.clientY - crossOffsetY + 22;
+      cross.style.left = (crossX-22) + "px";
+      cross.style.top = (crossY-22) + "px";
+      if (fixActive) drawCanvasOverlay();
+      updateEckpunkteAnzeigen();
+      e.preventDefault();
+    });
+    document.addEventListener('mouseup', ()=>{ draggingCross=false; });
+
+    // TRANSPARENZ
+    document.getElementById('opacity').addEventListener('input', e => {
+      opacity = e.target.value / 100;
+      overlayImg.style.opacity = opacity;
+      document.getElementById('opacity-value').textContent = Math.round(opacity*100) + "%";
+      if (fixActive) drawCanvasOverlay();
+      updateEckpunkteAnzeigen();
+    });
+
+    // FIXIEREN
+    document.getElementById('fix-btn').onclick = function() {
+      if (!overlayLoaded) return;
+      let ovRect = overlayImg.getBoundingClientRect();
+      let scaledW = overlayImg.width * zoomX;
+      let xf = (crossX - ovRect.left) / scaledW;
+      fixData = {
+        crossX: crossX,        // Zielkreuz-Fensterposition (Pixel)
+        relX: xf,              // relative Fixpunktposition im Overlay (0..1)
+        overlayTop: ovRect.top
+      };
+      fixActive = true;
+      document.getElementById('fix-btn').disabled = true;
+      document.getElementById('unfix-btn').disabled = false;
+      repaintBtn.disabled = false;
+      resetBtn.disabled = false;
+      overlayImg.style.display = 'none';
+      canvas.style.display = '';
+      drawCanvasOverlay();
+      updateEckpunkteAnzeigen();
+    };
+
+    // FIXIERUNG LÖSEN: Automatisch beide Sprünge durchlaufen!
+    document.getElementById('unfix-btn').onclick = function() {
+      fixActive = false;
+      document.getElementById('fix-btn').disabled = false;
+      document.getElementById('unfix-btn').disabled = true;
+      repaintBtn.disabled = false;
+      resetBtn.disabled = false;
+      // Debug-Ausgabe aus unfix-btn fixdata CS_2026-06-29_19-40
+      console.log("aus unfix-btn fixActive:", fixActive, "fixData:", fixData, "overlayLoaded:", overlayLoaded);
+      // 1. Zuerst mathematische Fixpunkt-Lage setzen
+      if (fixData) {
+      // Debug-Ausgabe aus unfix-btn if (fixData) CS_2026-06-29_19-40
+      console.log("aus unfix-btn if (fixData) -btn fixActive:", fixActive, "fixData:", fixData, "overlayLoaded:", overlayLoaded);
+      // 1. Zuerst mathematische Fixpunkt-Lage setzen
+   try { 
+    let ow = overlayImg.width;
+    let xf = fixData.relX * ow;
+    overlayImg.style.transformOrigin = xf + "px 0px";
+    overlayImg.style.left = (fixData.crossX - xf * zoomX) + "px";
+    overlayImg.style.top  = fixData.overlayTop + "px";
+    overlayImg.style.transform = `scale(${zoomX},1)`;
+    overlayImg.style.opacity = opacity;
+    overlayImg.style.display = '';
+    canvas.style.display = 'none';
+    //  -------- updateEckpunkteAnzeigen();
+    // 2. Dann (kurz danach) Canvas-Position übernehmen
+    // Debug-Ausgabe aus if (fixData) vor setTimeout CS_2026-06-29_19-40
+    console.log("setTimeout started at:", new Date().toISOString());
+    setTimeout(repaintBtn_simulate, 100);
+    function repaintBtn_simulate() {
+      // Debug-Ausgabe aus function repaintBtn_simulate setTimeout CS_2026-06-29_19-40
+      console.log("aus function repaintBtn_simulate setTimeout callback fired at:", new Date().toISOString());
+      // Debug-Ausgabe aus function repaintBtn_simulate fixdata CS_2026-06-29_19-40
+      console.log("aus function repaintBtn_simulate fixActive:", fixActive, "fixData:", fixData, "overlayLoaded:", overlayLoaded);
+      let eckCanvas = berechneEckpunkteCanvas();
+      // Debug-Ausgabe aus function repaintBtn_simulate Eckpunkte CS_2026-06-29_19-40
+      console.log("aus function repaintBtn_simulate eckCanvas:", eckCanvas);
+      // Debug-Ausgabe aus function repaintBtn_simulate display CS_2026-06-29_19-40
+      console.log('aus function repaintBtn_simulate display:', overlayImg.style.display, 'opacity:', overlayImg.style.opacity, 'z-index:', overlayImg.style.zIndex);
+      overlayImg.style.left = eckCanvas[0][0] + 'px';
+      overlayImg.style.top  = eckCanvas[0][1] + 'px';
+      overlayImg.style.transformOrigin = "0px 0px";
+      overlayImg.style.transform = `scale(${zoomX},1)`;
+      overlayImg.style.opacity = opacity;
+      overlayImg.style.display = '';
+      updateEckpunkteAnzeigen();
+    }
+  } catch (e) {
+    // Debug-Ausgabe aus unfix-btn .error CS_2026-06-29_19-40
+    console.error("Error before setTimeout:", e);
+    // Debug-Ausgabe aus unfix-btn Error before setTimeout CS_2026-06-29_19-40
+    console.log("Error before setTimeout:", e);
+  }
+  }
+};
+
+    // Button: IMG-Overlay auf aktuelle Canvas-Lage setzen (P1)
+    repaintBtn.onclick = function() {
+      if (!fixActive && fixData) {
+        // Debug-Ausgabe aus repaintBtn fixdata CS_2026-06-29_19-40
+        console.log("aus repaintBtn fixActive:", fixActive, "fixData:", fixData, "overlayLoaded:", overlayLoaded);
+        let eckCanvas = berechneEckpunkteCanvas();
+        // Debug-Ausgabe aus repaintBtn Eckpunkte CS_2026-06-29_19-40
+        console.log("aus repaintBtn eckCanvas:", eckCanvas);
+        // Debug-Ausgabe aus repaintBtn display CS_2026-06-29_19-40
+        console.log('aus repaintBtn display:', overlayImg.style.display, 'opacity:', overlayImg.style.opacity, 'z-index:', overlayImg.style.zIndex);
+        overlayImg.style.left = eckCanvas[0][0] + 'px';
+        overlayImg.style.top  = eckCanvas[0][1] + 'px';
+        overlayImg.style.transformOrigin = "0px 0px";
+        overlayImg.style.transform = `scale(${zoomX},1)`;
+        overlayImg.style.opacity = opacity;
+        overlayImg.style.display = '';
+        updateEckpunkteAnzeigen();
+      }
+    };
+
+    // Button: IMG-Overlay auf mathematisch berechnete Fixpunkt-Lage setzen
+    resetBtn.onclick = function() {
+      if (!fixActive && fixData) {
+        let ow = overlayImg.width;
+        let xf = fixData.relX * ow;
+        overlayImg.style.transformOrigin = xf + "px 0px";
+        overlayImg.style.left = (fixData.crossX - xf * zoomX) + "px";
+        overlayImg.style.top  = fixData.overlayTop + "px";
+        overlayImg.style.transform = `scale(${zoomX},1)`;
+        overlayImg.style.opacity = opacity;
+        overlayImg.style.display = '';
+        updateEckpunkteAnzeigen();
+      }
+    };
+
+    // CANVAS RENDERING MIT DEHNUNG UM FIXPUNKT
+    function drawCanvasOverlay() {
+      if (!fixData || !fixActive) return;
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+
+      let ow = overlayImg.width, oh = overlayImg.height;
+      let xf = fixData.relX * ow;
+      let fixScreenX = fixData.crossX;
+      let wL = xf, wR = ow - xf;
+      ctx.save();
+      ctx.globalAlpha = opacity;
+      // LINKS
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, fixScreenX, canvas.height);
+      ctx.clip();
+      ctx.transform(zoomX, 0, 0, 1, fixScreenX - xf*zoomX, fixData.overlayTop);
+      ctx.drawImage(overlayImg, 0, 0, wL, oh, 0, 0, wL, oh);
+      ctx.restore();
+      // RECHTS
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(fixScreenX, 0, canvas.width-fixScreenX, canvas.height);
+      ctx.clip();
+      ctx.transform(zoomX, 0, 0, 1, fixScreenX - xf*zoomX, fixData.overlayTop);
+      ctx.drawImage(overlayImg, xf, 0, wR, oh, xf, 0, wR, oh);
+      ctx.restore();
+      ctx.restore();
+      updateEckpunkteAnzeigen();
+    }
+
+    // INIT
+    window.onload = () => {
+      overlayImg.style.left = "100px";
+      overlayImg.style.top = "100px";
+      overlayImg.style.transformOrigin = "0px 0px";
+      overlayImg.style.transform = `scale(${zoomX},1)`;
+      cross.style.left = (crossX-22) + "px";
+      cross.style.top = (crossY-22) + "px";
+      overlayImg.style.opacity = opacity;
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      updateEckpunkteAnzeigen();
+    };
+    window.addEventListener('resize', () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      if (fixActive) drawCanvasOverlay();
+      updateEckpunkteAnzeigen();
+    });
+  </script>
+</body>
+</html>
